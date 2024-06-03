@@ -1,53 +1,75 @@
 package main
 
 import (
-	"flag"
+	"bytes"
+	"compress/gzip"
+	_ "embed"
+	"encoding/base64"
+	"encoding/json"
 	"log"
 	"os"
-	"slices"
-	"strings"
 
 	exec "golang.org/x/sys/execabs"
 )
 
+//go:embed wrapper.js
+var wrapperJS string
+
 func main() {
-	if len(os.Args) >= 2 {
-		if os.Args[1] == "build" {
-			v := false
-			for _, arg := range os.Args[2:] {
-				if arg == "-v" {
-					v = true
-					break
-				}
-			}
-			flagArgs := append([]string(nil), os.Args[2:]...)
-			if !v {
-				flagArgs = append([]string{"-v"}, flagArgs...)
-			}
+	os.Chdir("./examples/hello-world")
 
-			return
-		} else if os.Args[1] == "run" {
-
-			return
-		} else if os.Args[1] == "test" {
-			return
-		}
-	}
-
-	argv := append([]string(nil), os.Args...)
-	if len(argv) == 0 {
-		argv = append(argv, "go")
-	} else {
-		argv[0] = "go"
-	}
-	argv0, err := exec.LookPath(argv[0])
+	cmd := exec.Command("go", "build", "-o", "test.wasm", ".")
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, "GOOS=js", "GOARCH=wasm")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
-	envv := os.Environ()
-	envv = append(envv, "GOOS=js", "GOARCH=wasm")
 
-	err = Exec(argv0, argv, envv)
+	testWASM, err := os.ReadFile("test.wasm")
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = os.Remove("test.wasm")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	testWASMGz := bytes.Buffer{}
+	gzWriter := gzip.NewWriter(&testWASMGz)
+	_, err = gzWriter.Write(testWASM)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = gzWriter.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	testWASMGzBase64Text := base64.RawStdEncoding.EncodeToString(testWASMGz.Bytes())
+
+	testWASMGzBase64TextJSON, err := json.Marshal(testWASMGzBase64Text)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	preludeJS := "const __EMBED_TEST_WASM_GZ_BASE64_TEXT = " + string(testWASMGzBase64TextJSON) + ";\n"
+
+	artifactJS := preludeJS + "\n" + wrapperJS
+
+	err = os.WriteFile("test.mjs", []byte(artifactJS), 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cmd = exec.Command("node", "test.mjs")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
 	if err != nil {
 		log.Fatal(err)
 	}

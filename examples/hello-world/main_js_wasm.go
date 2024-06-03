@@ -7,7 +7,7 @@ import (
 )
 
 func main() {
-	jsNodeHTTP := js2.Await(js2.Import("node:http", nil))
+	jsNodeHTTP := js2.Await(js2.Import("node:http", js.Value{}))
 	jsHandler := js.FuncOf(func(this js.Value, args []js.Value) any {
 		// req := args[0]
 		res := args[1]
@@ -21,5 +21,5 @@ func main() {
 		jsServer.Call("close")
 		return nil
 	}))
-	select {}
+	<-make(chan struct{})
 }
