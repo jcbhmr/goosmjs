@@ -5,10 +5,6 @@ import (
 	"unsafe"
 )
 
-func ptr[T any](v T) *T {
-	return &v
-}
-
 var jsGo = func(id uint32, typeFlag byte) js.Value {
 	type ref uint64
 	const nanHead = 0x7FF80000
@@ -24,11 +20,11 @@ func Import(specifier any, options any) js.Value {
 	return jsGo.Call("_import", specifier, options)
 }
 
-var jsPromise *js.Value
+var jsPromise js.Value
 
 func Await(v js.Value) js.Value {
-	if jsPromise == nil {
-		jsPromise = ptr(js.Global().Get("Promise"))
+	if jsPromise.IsUndefined() {
+		jsPromise = (js.Global().Get("Promise"))
 	}
 	jsP := jsPromise.Call("resolve", v)
 	c := make(chan js.Value)
@@ -44,11 +40,24 @@ func Await(v js.Value) js.Value {
 	return <-c
 }
 
-var jsExports *js.Value
+var jsExports js.Value
 
 func Export(name string, value any) {
-	if jsExports == nil {
-		jsExports = ptr(jsGo.Get("exports"))
+	if jsExports.IsUndefined() {
+		jsExports = jsGo.Get("exports")
 	}
 	jsExports.Set(name, value)
+}
+
+var jsGlobalThis js.Value
+
+func Global() js.Value {
+	if jsGlobalThis.IsUndefined() {
+		jsGlobalThis = js.Global().Get("globalThis")
+	}
+	return jsGlobalThis
+}
+
+func Parallel() {
+	jsGo.Call("_parallel")
 }

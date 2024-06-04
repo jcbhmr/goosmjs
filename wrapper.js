@@ -134,6 +134,11 @@ if (!process) {
     chdir() {
       throw enosys();
     },
+    exit(code) {
+      if (code) {
+        throw `exit ${code}`;
+      }
+    }
   };
 }
 
@@ -164,11 +169,7 @@ class Go {
   constructor() {
     this.argv = ["js"];
     this.env = {};
-    this.exit = (code) => {
-      if (code !== 0) {
-        console.warn("exit code:", code);
-      }
-    };
+    this.exit = (code) => this.process.exit(code)
     this._exitPromise = new Promise((resolve) => {
       this._resolveExitPromise = resolve;
     });
@@ -308,7 +309,7 @@ class Go {
           const fd = getInt64(sp + 8);
           const p = getInt64(sp + 16);
           const n = this.mem.getInt32(sp + 24, true);
-          fs.writeSync(fd, new Uint8Array(this._inst.exports.mem.buffer, p, n));
+          this.fs.writeSync(fd, new Uint8Array(this._inst.exports.mem.buffer, p, n));
         },
 
         // func resetMemoryDataView()
@@ -552,6 +553,28 @@ class Go {
     }
     this._inst = instance;
     this.mem = new DataView(this._inst.exports.mem.buffer);
+
+    const fakeGlobal = this._fakeGlobal = new Proxy(globalThis, {
+      get: (target, p, receiver) => {
+        if (p === "fs") {
+          return this.fs;
+        } else if (p === "process") {
+          return this.process;
+        } else {
+          return Reflect.get(target, p, target);
+        }
+      },
+      set: (target, p, value, receiver) => {
+        if (p === "fs") {
+          this.fs = value;
+        } else if (p === "process") {
+          this.process = value;
+        } else {
+          Reflect.set(target, p, value, target);
+        }
+      },
+    });
+
     this._values = [
       // JS values that Go currently has references to, indexed by reference id
       NaN,
@@ -559,7 +582,7 @@ class Go {
       null,
       true,
       false,
-      globalThis,
+      fakeGlobal,
       this,
     ];
     this._goRefCounts = new Array(this._values.length).fill(Infinity); // number of references that Go has to a JS value, indexed by reference id
@@ -569,7 +592,7 @@ class Go {
       [null, 2],
       [true, 3],
       [false, 4],
-      [globalThis, 5],
+      [fakeGlobal, 5],
       [this, 6],
     ]);
     this._idPool = []; // unused ids that have been garbage collected
@@ -623,7 +646,7 @@ class Go {
     if (this.exited) {
       this._resolveExitPromise();
     }
-    await this._exitPromise;
+    await this._runPromise;
   }
 
   _resume() {
@@ -646,6 +669,8 @@ class Go {
     };
   }
 
+  fs = fs;
+  process = process;
   exports = { __proto__: null };
   _import(s, o) {
     return import(s, o);
@@ -687,50 +712,6 @@ function getOptions(options) {
     return options;
   }
   throw new TypeError("options is not object");
-}
-
-export function uint8ArrayToBase64(arr, options) {
-  checkUint8Array(arr);
-  let opts = getOptions(options);
-  let alphabet = opts.alphabet;
-  if (typeof alphabet === "undefined") {
-    alphabet = "base64";
-  }
-  if (alphabet !== "base64" && alphabet !== "base64url") {
-    throw new TypeError(
-      'expected alphabet to be either "base64" or "base64url"'
-    );
-  }
-
-  if ("detached" in arr.buffer && arr.buffer.detached) {
-    throw new TypeError("toBase64 called on array backed by detached buffer");
-  }
-
-  let lookup = alphabet === "base64" ? base64Characters : base64UrlCharacters;
-  let result = "";
-
-  let i = 0;
-  for (; i + 2 < arr.length; i += 3) {
-    let triplet = (arr[i] << 16) + (arr[i + 1] << 8) + arr[i + 2];
-    result +=
-      lookup[(triplet >> 18) & 63] +
-      lookup[(triplet >> 12) & 63] +
-      lookup[(triplet >> 6) & 63] +
-      lookup[triplet & 63];
-  }
-  if (i + 2 === arr.length) {
-    let triplet = (arr[i] << 16) + (arr[i + 1] << 8);
-    result +=
-      lookup[(triplet >> 18) & 63] +
-      lookup[(triplet >> 12) & 63] +
-      lookup[(triplet >> 6) & 63] +
-      "=";
-  } else if (i + 1 === arr.length) {
-    let triplet = arr[i] << 16;
-    result +=
-      lookup[(triplet >> 18) & 63] + lookup[(triplet >> 12) & 63] + "==";
-  }
-  return result;
 }
 
 function decodeBase64Chunk(chunk, throwOnExtraBits) {
@@ -912,132 +893,21 @@ function base64ToUint8Array(string, options, into) {
   return { read, bytes };
 }
 
-function uint8ArrayToHex(arr) {
-  checkUint8Array(arr);
-  if ("detached" in arr.buffer && arr.buffer.detached) {
-    throw new TypeError("toHex called on array backed by detached buffer");
-  }
-  let out = "";
-  for (let i = 0; i < arr.length; ++i) {
-    out += arr[i].toString(16).padStart(2, "0");
-  }
-  return out;
-}
 
-function hexToUint8Array(string, into) {
-  if (typeof string !== "string") {
-    throw new TypeError("expected string to be a string");
-  }
-  if (into && "detached" in into.buffer && into.buffer.detached) {
-    throw new TypeError(
-      "fromHexInto called on array backed by detached buffer"
-    );
-  }
-  if (string.length % 2 !== 0) {
-    throw new SyntaxError("string should be an even number of characters");
-  }
-
-  let maxLength = into ? into.length : 2 ** 53 - 1;
-
-  // TODO should hex allow whitespace?
-  // TODO should hex support lastChunkHandling? (only 'strict' or 'stop-before-partial')
-  let bytes = [];
-  let index = 0;
-  if (maxLength > 0) {
-    while (index < string.length) {
-      let hexits = string.slice(index, index + 2);
-      if (/[^0-9a-fA-F]/.test(hexits)) {
-        throw new SyntaxError("string should only contain hex characters");
-      }
-      bytes.push(parseInt(hexits, 16));
-      index += 2;
-      if (bytes.length === maxLength) {
-        break;
-      }
-    }
-  }
-
-  bytes = new Uint8Array(bytes);
-  if (into && bytes.length > 0) {
-    assert(bytes.length <= into.length);
-    into.set(bytes);
-  }
-
-  return { read: index, bytes };
-}
-
-// method shenanigans to make a non-constructor which can refer to "this"
-Uint8Array.prototype.toBase64 = {
-  toBase64(options) {
-    return uint8ArrayToBase64(this, options);
-  },
-}.toBase64;
-Object.defineProperty(Uint8Array.prototype, "toBase64", { enumerable: false });
-Object.defineProperty(Uint8Array.prototype.toBase64, "length", { value: 0 });
-
-Uint8Array.fromBase64 = (string, options) => {
+const Uint8ArrayFromBase64 = (string, options) => {
   if (typeof string !== "string") {
     throw new TypeError("expected input to be a string");
   }
   return base64ToUint8Array(string, options).bytes;
 };
-Object.defineProperty(Uint8Array, "fromBase64", { enumerable: false });
-Object.defineProperty(Uint8Array.fromBase64, "length", { value: 1 });
-Object.defineProperty(Uint8Array.fromBase64, "name", { value: "fromBase64" });
-
-// method shenanigans to make a non-constructor which can refer to "this"
-Uint8Array.prototype.setFromBase64 = {
-  setFromBase64(string, options) {
-    checkUint8Array(this);
-    if (typeof string !== "string") {
-      throw new TypeError("expected input to be a string");
-    }
-    let { read, bytes } = base64ToUint8Array(string, options, this);
-    return { read, written: bytes.length };
-  },
-}.setFromBase64;
-Object.defineProperty(Uint8Array.prototype, "setFromBase64", {
-  enumerable: false,
-});
-Object.defineProperty(Uint8Array.prototype.setFromBase64, "length", {
-  value: 1,
-});
-
-Uint8Array.prototype.toHex = {
-  toHex() {
-    return uint8ArrayToHex(this);
-  },
-}.toHex;
-Object.defineProperty(Uint8Array.prototype, "toHex", { enumerable: false });
-
-Uint8Array.fromHex = (string) => {
-  if (typeof string !== "string") {
-    throw new TypeError("expected input to be a string");
-  }
-  return hexToUint8Array(string).bytes;
-};
-Object.defineProperty(Uint8Array, "fromHex", { enumerable: false });
-Object.defineProperty(Uint8Array.fromHex, "name", { value: "fromHex" });
-
-Uint8Array.prototype.setFromHex = {
-  setFromHex(string) {
-    checkUint8Array(this);
-    if (typeof string !== "string") {
-      throw new TypeError("expected input to be a string");
-    }
-    let { read, bytes } = hexToUint8Array(string, this);
-    return { read, written: bytes.length };
-  },
-}.setFromHex;
-Object.defineProperty(Uint8Array.prototype, "setFromHex", {
-  enumerable: false,
-});
+Object.defineProperty(Uint8ArrayFromBase64, "length", { value: 1 });
+Object.defineProperty(Uint8ArrayFromBase64, "name", { value: "fromBase64" });
 
 // __EMBED_* constants are prepended to this file at build time.
 const testWASMGzBase64Text = /** @type {string} */ (
   __EMBED_TEST_WASM_GZ_BASE64_TEXT
 );
-const testWASMGzBytes = Uint8Array.fromBase64(testWASMGzBase64Text);
+const testWASMGzBytes = Uint8ArrayFromBase64(testWASMGzBase64Text);
 const testWASMReadable = new Response(testWASMGzBytes).body.pipeThrough(
   new DecompressionStream("gzip")
 );
